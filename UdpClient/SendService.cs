@@ -34,81 +34,124 @@ public class SendService
 
         uint seq = 0;
         byte[] payload = new byte[_payloadSize];
-        var lastStatsTime = DateTime.UtcNow;
-        long bytesSinceLastStats = 0;
-        int skipLogThrottle = 0;
-
-        // Rate limiter
-        var sw = Stopwatch.StartNew();
-        long totalPacketsAttempted = 0;
+        var stats = new StatsState();
+        var rateLimiter = new RateLimiter(TargetPacketsPerSec);
 
         while (!ct.IsCancellationRequested)
         {
-            // Random skip
-            if (Random.Shared.NextDouble() < _skipProbability)
+            if (TrySkip(seq, ref stats.SkipLogThrottle))
             {
-                SkippedCount++;
-                totalPacketsAttempted++;
-                if (++skipLogThrottle % 20 == 0)
-                    Console.WriteLine($"[SKIP] Seq {seq} skipped ({SkippedCount} total)");
                 seq++;
+                rateLimiter.OnPacketAttempted();
                 continue;
             }
 
-            Random.Shared.NextBytes(payload);
-            byte[] packet = PacketHelper.BuildDataPacket(seq, payload);
-            PendingPackets[seq] = packet;
-
-            try
-            {
-                _udpClient.Send(packet, packet.Length, _serverEndPoint);
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
-            {
-                Console.WriteLine("[CLIENT] Server disconnected");
+            if (!TrySendPacket(seq, payload, ref stats.BytesSinceLastStats))
                 break;
-            }
-            SentCount++;
-            bytesSinceLastStats += packet.Length;
-            totalPacketsAttempted++;
 
-            // Clean old pending packets (older than 5000 seqs)
-            if (seq > 5000 && seq % 1000 == 0)
-            {
-                uint cutoff = seq - 5000;
-                foreach (var key in PendingPackets.Keys)
-                {
-                    if (key < cutoff)
-                        PendingPackets.TryRemove(key, out _);
-                }
-            }
-
+            CleanupOldPending(seq);
             seq++;
+            rateLimiter.OnPacketAttempted();
 
-            // Stats every 1 second
-            var now = DateTime.UtcNow;
-            if ((now - lastStatsTime).TotalMilliseconds >= 1000)
-            {
-                double elapsed = (now - lastStatsTime).TotalSeconds;
-                double rateMb = bytesSinceLastStats / elapsed / 1_000_000;
-
-                Console.WriteLine(
-                    $"[STAT] Sent: {SentCount} | " +
-                    $"Skipped: {SkippedCount} | " +
-                    $"Retransmitted: {RetransmitService.RetransmitCount} | " +
-                    $"Rate: {rateMb:F2} MB/s");
-
-                lastStatsTime = now;
-                bytesSinceLastStats = 0;
-            }
-
-            // Rate limit: if we're ahead of schedule, sleep
-            long expectedMs = totalPacketsAttempted * 1000 / TargetPacketsPerSec;
-            long actualMs = sw.ElapsedMilliseconds;
-            if (expectedMs > actualMs)
-            {
-                Thread.Sleep((int)(expectedMs - actualMs));
-            }
+            stats.TryPrint(SentCount, SkippedCount);
+            rateLimiter.Apply();
         }
     });
+
+    private bool TrySkip(uint seq, ref int skipLogThrottle)
+    {
+        if (Random.Shared.NextDouble() >= _skipProbability)
+            return false;
+
+        SkippedCount++;
+        if (++skipLogThrottle % 20 == 0)
+            Console.WriteLine($"[SKIP] Seq {seq} skipped ({SkippedCount} total)");
+        return true;
+    }
+
+    private bool TrySendPacket(uint seq, byte[] payload, ref long bytesSinceLastStats)
+    {
+        Random.Shared.NextBytes(payload);
+        byte[] packet = PacketHelper.BuildDataPacket(seq, payload);
+        PendingPackets[seq] = packet;
+
+        try
+        {
+            _udpClient.Send(packet, packet.Length, _serverEndPoint);
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+        {
+            Console.WriteLine("[CLIENT] Server disconnected");
+            return false;
+        }
+
+        SentCount++;
+        bytesSinceLastStats += packet.Length;
+        return true;
+    }
+
+    private void CleanupOldPending(uint seq)
+    {
+        if (seq <= 5000 || seq % 1000 != 0)
+            return;
+
+        uint cutoff = seq - 5000;
+        foreach (var key in PendingPackets.Keys)
+        {
+            if (key < cutoff)
+                PendingPackets.TryRemove(key, out _);
+        }
+    }
+
+    private struct StatsState
+    {
+        public long BytesSinceLastStats;
+        public int SkipLogThrottle;
+        private DateTime _lastStatsTime = DateTime.UtcNow;
+
+        public StatsState() { }
+
+        public void TryPrint(int sentCount, int skippedCount)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastStatsTime).TotalMilliseconds < 1000)
+                return;
+
+            double elapsed = (now - _lastStatsTime).TotalSeconds;
+            double rateMb = BytesSinceLastStats / elapsed / 1_000_000;
+
+            Console.WriteLine(
+                $"[STAT] Sent: {sentCount} | " +
+                $"Skipped: {skippedCount} | " +
+                $"Retransmitted: {RetransmitService.RetransmitCount} | " +
+                $"Rate: {rateMb:F2} MB/s");
+
+            _lastStatsTime = now;
+            BytesSinceLastStats = 0;
+        }
+    }
+
+    private struct RateLimiter
+    {
+        private readonly int _targetPacketsPerSec;
+        private readonly Stopwatch _sw;
+        private long _totalPacketsAttempted;
+
+        public RateLimiter(int targetPacketsPerSec)
+        {
+            _targetPacketsPerSec = targetPacketsPerSec;
+            _sw = Stopwatch.StartNew();
+            _totalPacketsAttempted = 0;
+        }
+
+        public void OnPacketAttempted() => _totalPacketsAttempted++;
+
+        public void Apply()
+        {
+            long expectedMs = _totalPacketsAttempted * 1000 / _targetPacketsPerSec;
+            long actualMs = _sw.ElapsedMilliseconds;
+            if (expectedMs > actualMs)
+                Thread.Sleep((int)(expectedMs - actualMs));
+        }
+    }
 }

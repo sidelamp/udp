@@ -22,89 +22,66 @@ public class ReceiverService
         _nackIntervalMs = nackIntervalMs;
     }
 
+    ~ReceiverService()
+    {
+        _udpServer.Dispose();
+    }
+
     public Task RunAsync(CancellationToken ct) => Task.Run(() =>
     {
         Console.WriteLine($"[SERVER] Listening on port {_udpServer.Client.LocalEndPoint}...");
         Console.WriteLine("[SERVER] Press Ctrl+C to stop\n");
 
-        var lastStatsTime = DateTime.UtcNow;
-        var lastNackTime = DateTime.UtcNow;
-        long bytesSinceLastStats = 0;
+        var stats = new StatsState();
+        var nackScheduler = new NackScheduler(_nackIntervalMs);
+        int nackSentCount = 0;
 
         while (!ct.IsCancellationRequested)
         {
-            // Try to receive a packet (blocks up to timeout)
-            try
+            if (TryReceive(out byte[]? data, out IPEndPoint? remoteEp))
             {
-                var remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                byte[] data = _udpServer.Receive(ref remoteEp);
-
                 _clientEndPoint ??= remoteEp;
-
-                if (PacketHelper.TryParseDataPacket(data, out uint seq, out byte[] payload))
-                {
-                    _buffer.Insert(seq, payload);
-                    _buffer.AdvanceContiguous();
-                    bytesSinceLastStats += data.Length;
-                }
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
-            {
-                // Timeout — fall through to periodic checks
-            }
-            catch (SocketException ex) when (ct.IsCancellationRequested || ex.SocketErrorCode == SocketError.ConnectionReset)
-            {
-                break;
+                ProcessDataPacket(data!, ref stats.BytesSinceLastStats);
             }
 
             var now = DateTime.UtcNow;
-
-            // NACK scan on interval (not every packet)
-            if ((now - lastNackTime).TotalMilliseconds >= _nackIntervalMs)
-            {
-                lastNackTime = now;
-
-                var gaps = _buffer.ScanForGaps();
-                var toNack = gaps.Where(seq =>
-                    !_nackCooldown.TryGetValue(seq, out var lastNack) ||
-                    (now - lastNack) > CooldownTime).ToList();
-
-                if (toNack.Count > 0 && _clientEndPoint != null)
-                {
-                    foreach (uint seq in toNack)
-                        _nackCooldown[seq] = now;
-                    SendNacks(toNack);
-                }
-
-                // Clean cooldown entries for filled gaps
-                if (_nackCooldown.Count > 100)
-                {
-                    var filled = _nackCooldown.Keys.Where(k => !_buffer.IsGap(k)).ToList();
-                    foreach (uint seq in filled)
-                        _nackCooldown.Remove(seq);
-                }
-            }
-
-            // Stats every 1 second
-            if ((now - lastStatsTime).TotalMilliseconds >= 1000)
-            {
-                double elapsed = (now - lastStatsTime).TotalSeconds;
-                double rateMb = bytesSinceLastStats / elapsed / 1_000_000;
-
-                Console.WriteLine(
-                    $"[STAT] Received: {_buffer.TotalReceived} | " +
-                    $"Gaps: {_buffer.TotalGapsDetected} | " +
-                    $"NACKed: {NackSentCount} | " +
-                    $"Rate: {rateMb:F2} MB/s | " +
-                    $"Buffered: {_buffer.BufferedCount}/{_buffer.Capacity}");
-
-                lastStatsTime = now;
-                bytesSinceLastStats = 0;
-            }
+            nackScheduler.TryRun(now, _buffer, _nackCooldown, _clientEndPoint, SendNacks, ref nackSentCount);
+            NackSentCount = nackSentCount;
+            stats.TryPrint(_buffer, nackSentCount);
         }
 
         Console.WriteLine($"\n[SERVER] Shutdown. Final: Received={_buffer.TotalReceived}, Gaps={_buffer.TotalGapsDetected}");
     });
+
+    private bool TryReceive(out byte[]? data, out IPEndPoint? remoteEp)
+    {
+        data = null;
+        remoteEp = null;
+        try
+        {
+            remoteEp = new IPEndPoint(IPAddress.Any, 0);
+            data = _udpServer.Receive(ref remoteEp);
+            return true;
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+        {
+            return false;
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+        {
+            return false;
+        }
+    }
+
+    private void ProcessDataPacket(byte[] data, ref long bytesSinceLastStats)
+    {
+        if (PacketHelper.TryParseDataPacket(data, out uint seq, out byte[] payload))
+        {
+            _buffer.Insert(seq, payload);
+            _buffer.AdvanceContiguous();
+            bytesSinceLastStats += data.Length;
+        }
+    }
 
     private void SendNacks(List<uint> missingSeqs)
     {
@@ -126,4 +103,73 @@ public class ReceiverService
             NackSentCount += chunk.Count;
         }
     }
+
+    #region Structs
+    private struct StatsState
+    {
+        public long BytesSinceLastStats;
+        private DateTime _lastStatsTime = DateTime.UtcNow;
+
+        public StatsState() { }
+
+        public void TryPrint(RingBuffer buffer, int nackSentCount)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastStatsTime).TotalMilliseconds < 1000)
+                return;
+
+            double elapsed = (now - _lastStatsTime).TotalSeconds;
+            double rateMb = BytesSinceLastStats / elapsed / 1_000_000;
+
+            Console.WriteLine(
+                $"[STAT] Received: {buffer.TotalReceived} | " +
+                $"Gaps: {buffer.TotalGapsDetected} | " +
+                $"NACKed: {nackSentCount} | " +
+                $"Rate: {rateMb:F2} MB/s | " +
+                $"Buffered: {buffer.BufferedCount}/{buffer.Capacity}");
+
+            _lastStatsTime = now;
+            BytesSinceLastStats = 0;
+        }
+    }
+
+    private struct NackScheduler(int intervalMs)
+    {
+        private DateTime _lastNackTime = DateTime.UtcNow;
+
+        public void TryRun(
+            DateTime now,
+            RingBuffer buffer,
+            Dictionary<uint, DateTime> cooldown,
+            IPEndPoint? clientEndPoint,
+            Action<List<uint>> sendNacks,
+            ref int nackSentCount)
+        {
+            if ((now - _lastNackTime).TotalMilliseconds < intervalMs)
+                return;
+
+            _lastNackTime = now;
+
+            var gaps = buffer.ScanForGaps();
+            var toNack = gaps.Where(seq =>
+                !cooldown.TryGetValue(seq, out var lastNack) ||
+                (now - lastNack) > CooldownTime).ToList();
+
+            if (toNack.Count > 0 && clientEndPoint != null)
+            {
+                foreach (uint seq in toNack)
+                    cooldown[seq] = now;
+                sendNacks(toNack);
+                nackSentCount += toNack.Count;
+            }
+
+            if (cooldown.Count > 100)
+            {
+                var filled = cooldown.Keys.Where(k => !buffer.IsGap(k)).ToList();
+                foreach (uint seq in filled)
+                    cooldown.Remove(seq);
+            }
+        }
+    }
+    #endregion
 }

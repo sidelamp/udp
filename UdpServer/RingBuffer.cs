@@ -21,27 +21,38 @@ public class RingBuffer
     {
         if (seq < BaseSeq) return; // too old, evicted
 
-        // Detect new gaps: packets between HighestSeqSeen and seq are missing
+        DetectGaps(seq);
+        AdvanceWindowIfNeeded(seq);
+        WriteSlot(seq, data);
+    }
+
+    private void DetectGaps(uint seq)
+    {
         if (TotalReceived > 0 && seq > HighestSeqSeen)
         {
             uint newGaps = seq - HighestSeqSeen - 1;
             TotalGapsDetected += (int)newGaps;
         }
+    }
 
-        // Advance window if needed
-        if (seq >= BaseSeq + (uint)Capacity)
+    private void AdvanceWindowIfNeeded(uint seq)
+    {
+        if (seq < BaseSeq + (uint)Capacity)
+            return;
+
+        uint advance = seq - BaseSeq - (uint)Capacity + 1;
+        for (uint i = 0; i < advance; i++)
         {
-            uint advance = seq - BaseSeq - (uint)Capacity + 1;
-            for (uint i = 0; i < advance; i++)
-            {
-                int idx = (int)((BaseSeq + i) % (uint)Capacity);
-                _buffer[idx] = default;
-            }
-            BaseSeq += advance;
-            if (NextExpected < BaseSeq)
-                NextExpected = BaseSeq;
+            int idx = (int)((BaseSeq + i) % (uint)Capacity);
+            _buffer[idx] = default;
         }
+        BaseSeq += advance;
+        if (NextExpected < BaseSeq)
+            NextExpected = BaseSeq;
+    }
 
+    private void WriteSlot(uint seq, byte[] data)
+    {
         int index = (int)((seq - BaseSeq) % (uint)Capacity);
         _buffer[index] = new Slot(data, true);
         TotalReceived++;

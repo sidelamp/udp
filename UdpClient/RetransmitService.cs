@@ -22,51 +22,73 @@ public class RetransmitService
 
     public Task RunAsync(CancellationToken ct) => Task.Run(() =>
     {
-        int expiredCount = 0;
-        int lastLogCount = 0;
-
         _udpClient.Client.ReceiveTimeout = 1000;
+
+        var stats = new RetransmitStats();
 
         while (!ct.IsCancellationRequested)
         {
-            try
-            {
-                var remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                byte[] data = _udpClient.Receive(ref remoteEp);
+            if (!TryReceive(out byte[]? data))
+                continue;
 
-                if (PacketHelper.TryParseNack(data, out List<uint> missingSeqs))
-                {
-                    foreach (uint seq in missingSeqs)
-                    {
-                        if (_pendingPackets.TryGetValue(seq, out byte[]? packet))
-                        {
-                            _udpClient.Send(packet, packet.Length, _serverEndPoint);
-                            RetransmitCount++;
-                        }
-                        else
-                        {
-                            expiredCount++;
-                        }
-                    }
-                    if (RetransmitCount / 100 > lastLogCount / 100 && RetransmitCount > 0)
-                    {
-                        lastLogCount = RetransmitCount;
-                        Console.WriteLine($"[RETX] Retransmitted: {RetransmitCount}, expired: {expiredCount}");
-                    }
-                }
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
-            {
-                // Timeout — loop back to check cancellation
-            }
-            catch (SocketException ex) when (ct.IsCancellationRequested || ex.SocketErrorCode == SocketError.ConnectionReset)
-            {
-                break;
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
+            if (PacketHelper.TryParseNack(data!, out List<uint> missingSeqs))
+                ProcessNack(missingSeqs, ref stats);
         }
     });
+
+    private bool TryReceive(out byte[]? data)
+    {
+        data = null;
+        try
+        {
+            var remoteEp = new IPEndPoint(IPAddress.Any, 0);
+            data = _udpClient.Receive(ref remoteEp);
+            return true;
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+        {
+            return false;
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+        {
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    private void ProcessNack(List<uint> missingSeqs, ref RetransmitStats stats)
+    {
+        foreach (uint seq in missingSeqs)
+        {
+            if (_pendingPackets.TryGetValue(seq, out byte[]? packet))
+            {
+                _udpClient.Send(packet, packet.Length, _serverEndPoint);
+                RetransmitCount++;
+            }
+            else
+            {
+                stats.ExpiredCount++;
+            }
+        }
+
+        stats.TryLog(RetransmitCount);
+    }
+
+    private struct RetransmitStats
+    {
+        public int ExpiredCount;
+        private int _lastLogCount;
+
+        public void TryLog(int retransmitCount)
+        {
+            if (retransmitCount / 100 <= _lastLogCount / 100 || retransmitCount == 0)
+                return;
+
+            _lastLogCount = retransmitCount;
+            Console.WriteLine($"[RETX] Retransmitted: {retransmitCount}, expired: {ExpiredCount}");
+        }
+    }
 }
