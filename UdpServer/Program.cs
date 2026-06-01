@@ -1,20 +1,25 @@
 using System.Net;
-using System.Net.Sockets;
-using System.Text;
+using UdpServer;
 
-Console.WriteLine("UDP Server starting on port 5000...");
+// Config
+const int ListenPort = 5000;
+const int BufferCapacity = 1000;
+const int NackIntervalMs = 100;
 
-using var udpServer = new UdpClient(5000);
-
-while (true)
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
 {
-    var remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
-    byte[] receivedBytes = udpServer.Receive(ref remoteEndPoint);
-    string receivedText = Encoding.UTF8.GetString(receivedBytes);
+    e.Cancel = true;
+    cts.Cancel();
+};
 
-    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] From {remoteEndPoint}: {receivedText}");
+var service = new ReceiverService(ListenPort, BufferCapacity, NackIntervalMs);
 
-    string response = $"re: {receivedText}";
-    byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-    udpServer.Send(responseBytes, responseBytes.Length, remoteEndPoint);
+try
+{
+    await service.RunAsync(cts.Token);
+}
+catch (OperationCanceledException)
+{
+    // Expected on shutdown
 }

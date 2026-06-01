@@ -1,31 +1,37 @@
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
+using NetUdpClient = System.Net.Sockets.UdpClient;
+using UdpClient;
 
-Console.WriteLine("UDP Client starting...");
+// Config
+const string ServerHost = "127.0.0.1";
+const int ServerPort = 5000;
+const int PayloadSize = 1024;
+const double SkipProbability = 0.02; // 2%
 
-using var udpClient = new UdpClient();
-var serverEndPoint = new IPEndPoint(IPAddress.Loopback, 5000);
+var serverEndPoint = new IPEndPoint(IPAddress.Parse(ServerHost), ServerPort);
+using var udpClient = new NetUdpClient(5001);
+Console.WriteLine($"[CLIENT] Local endpoint: {udpClient.Client.LocalEndPoint}");
 
-string message = "TEST UDP";
-byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+};
 
-Console.WriteLine($"Sending: {message}");
-udpClient.Send(messageBytes, messageBytes.Length, serverEndPoint);
+var sendService = new SendService(udpClient, serverEndPoint, PayloadSize, SkipProbability);
+var retransmitService = new RetransmitService(udpClient, serverEndPoint, sendService.PendingPackets);
 
-udpClient.Client.ReceiveTimeout = 5000;
 try
 {
-    var remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
-    byte[] receivedBytes = udpClient.Receive(ref remoteEndPoint);
-    var receivedText = Encoding.UTF8.GetString(receivedBytes);
-
-    Console.WriteLine($"Received from server: {receivedText}");
+    await Task.WhenAll(
+        sendService.RunAsync(cts.Token),
+        retransmitService.RunAsync(cts.Token));
 }
-catch (SocketException)
+catch (OperationCanceledException)
 {
-    Console.WriteLine("No response from server (timeout).");
+    // Expected on shutdown
 }
 
-Console.WriteLine("Press any key to exit...");
-Console.ReadKey();
+Console.WriteLine("\n[CLIENT] Shutdown complete.");
