@@ -86,6 +86,65 @@ dotnet run --project UdpServer
 dotnet run --project UdpClient
 ```
 
+## Running on Linux
+
+### Prerequisites
+
+Install the .NET 8.0 SDK (or runtime for published apps):
+
+```bash
+# Ubuntu / Debian
+sudo apt update && sudo apt install -y dotnet-sdk-8.0
+
+# Or use the official install script:
+# https://dot.net/v1/dotnet-install.sh
+```
+
+### Run from source
+
+```bash
+# Terminal 1 — start the server
+dotnet run --project UdpServer
+
+# Terminal 2 — start the client
+dotnet run --project UdpClient
+```
+
+### Publish
+
+Build self-contained, single-file executables for Linux x64:
+
+```bash
+# Server
+dotnet publish UdpServer -c Release -r linux-x64 --self-contained true \
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+  -o publish/server
+
+# Client
+dotnet publish UdpClient -c Release -r linux-x64 --self-contained true \
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+  -o publish/client
+```
+
+> For a smaller output that still requires the .NET runtime on the target machine,
+> replace `--self-contained true` with `--self-contained false`.
+
+### Run published binaries
+
+```bash
+# Copy the publish/ folder to the target Linux machine, then:
+
+# Terminal 1 — server
+chmod +x publish/server/UdpServer
+./publish/server/UdpServer
+
+# Terminal 2 — client
+chmod +x publish/client/UdpClient
+./publish/client/UdpClient
+```
+
+No .NET runtime is required on the target machine when published with `--self-contained true`.
+
 Press **Ctrl+C** to stop either application gracefully.
 
 ## Output
