@@ -34,7 +34,7 @@ public class RetransmitService
             if (PacketHelper.TryParseNack(data!, out List<uint> missingSeqs))
                 ProcessNack(missingSeqs, ref stats);
         }
-    });
+    }, ct);
 
     private bool TryReceive(out byte[]? data)
     {

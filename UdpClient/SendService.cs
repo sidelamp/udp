@@ -56,9 +56,9 @@ public class SendService
             stats.TryPrint(SentCount, SkippedCount);
             rateLimiter.Apply();
         }
-    });
+    }, ct);
 
-    private bool TrySkip(uint seq, ref int skipLogThrottle)
+    private bool TrySkip(uint seq, ref int skipLogThrottle) // simulate packet loss by randomly skipping some packets
     {
         if (Random.Shared.NextDouble() >= _skipProbability)
             return false;
@@ -103,6 +103,7 @@ public class SendService
         }
     }
 
+    #region Stats and Rate Limiting
     private struct StatsState
     {
         public long BytesSinceLastStats;
@@ -154,4 +155,5 @@ public class SendService
                 Thread.Sleep((int)(expectedMs - actualMs));
         }
     }
+    #endregion
 }

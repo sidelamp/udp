@@ -104,7 +104,7 @@ public class ReceiverService
         }
     }
 
-    #region Structs
+    #region Helpers
     private struct StatsState
     {
         public long BytesSinceLastStats;
